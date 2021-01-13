@@ -4,6 +4,7 @@ import numpy as np
 from copy import deepcopy
 from rlcard.games.limitholdem import Game
 from rlcard.games.limitholdem import PlayerStatus
+from rlcard.games.limitholdem.utils import compare_hands
 
 from rlcard.games.nolimitholdem import Dealer
 from rlcard.games.nolimitholdem import Player
@@ -40,6 +41,8 @@ class NolimitholdemGame(Game):
         # Randomly choose a dealer
         self.dealer_id = self.np_random.randint(0, self.num_players)
 
+        self.record_steps = False
+
     def configure(self, game_config):
         ''' Specifiy some game specific parameters, such as player number and initial chips
         '''
@@ -47,6 +50,7 @@ class NolimitholdemGame(Game):
         self.init_chips = game_config['chips_for_each']
         self.dealer_id = game_config['dealer_id'] if game_config['dealer_id'] is not None else \
             self.np_random.randint(0, self.num_players)
+        self.record_steps = game_config['record_steps']
 
     def init_game(self):
         ''' Initialilze the game of Limit Texas Hold'em
@@ -59,6 +63,10 @@ class NolimitholdemGame(Game):
                 (dict): The first state of the game
                 (int): Current player's id
         '''
+        # Initialize step recorder
+        if self.record_steps:
+            self.steps_recorder = StepsRecorder(self.num_players)
+
         # Initilize a dealer that can deal cards
         self.dealer = Dealer(self.np_random)
 
@@ -81,6 +89,17 @@ class NolimitholdemGame(Game):
         b = (self.dealer_id + 2) % self.num_players
         self.players[b].bet(chips=self.big_blind)
         self.players[s].bet(chips=self.small_blind)
+
+        # Record dealer and hands and blinds
+        if self.record_steps:
+            self.steps_recorder.add_step_dealer_designed(self.dealer_id)
+            for i in range(self.num_players):
+                player_id = (i + self.dealer_id + 1) % self.num_players
+                if self.record_steps:
+                    self.steps_recorder.add_step_hand_dealt(player_id,
+                                                            [str(card) for card in self.players[player_id].hand])
+            self.steps_recorder.add_step_blind(s, self.small_blind)
+            self.steps_recorder.add_step_blind(b, self.big_blind)
 
         # The player next to the small blind plays the first
         self.game_pointer = (b + 1) % self.num_players
@@ -137,8 +156,14 @@ class NolimitholdemGame(Game):
             ps = deepcopy(self.players)
             self.history.append((r, b, r_c, d, p, ps))
 
+        player_acting = self.game_pointer
+
         # Then we proceed to the next round
         self.game_pointer = self.round.proceed_round(self.players, action)
+
+        if self.record_steps:
+            self.steps_recorder.add_step_player_action(player_acting, action, self.players[player_acting].status,
+                                                       self.get_state())
 
         players_in_bypass = [1 if player.status in (PlayerStatus.FOLDED, PlayerStatus.ALLIN) else 0 for player in self.players]
         if self.num_players - sum(players_in_bypass) == 1:
@@ -147,8 +172,10 @@ class NolimitholdemGame(Game):
                 # If the last player has put enough chips, he is also bypassed
                 players_in_bypass[last_player] = 1
 
+        players_alive = self.num_players - sum(player.status == PlayerStatus.FOLDED for player in self.players)
+
         # If a round is over, we deal more public cards
-        if self.round.is_over():
+        if self.round.is_over() and players_alive > 1:
             # Game pointer goes to the first player not in bypass after the dealer, if there is one
             self.game_pointer = (self.dealer_id + 1) % self.num_players
             if sum(players_in_bypass) < self.num_players:
@@ -161,17 +188,26 @@ class NolimitholdemGame(Game):
                 self.public_cards.append(self.dealer.deal_card())
                 self.public_cards.append(self.dealer.deal_card())
                 self.public_cards.append(self.dealer.deal_card())
+                if self.record_steps:
+                    self.steps_recorder.add_step_next_stage(self.stage, [str(card) for card in self.public_cards[-3:]],
+                                                            self.get_state())
                 if len(self.players) == np.sum(players_in_bypass):
                     self.round_counter += 1
             # For the following rounds, we deal only 1 card
             if self.round_counter == 1:
                 self.stage = Stage.TURN
                 self.public_cards.append(self.dealer.deal_card())
+                if self.record_steps:
+                    self.steps_recorder.add_step_next_stage(self.stage, [str(self.public_cards[-1])],
+                                                            self.get_state())
                 if len(self.players) == np.sum(players_in_bypass):
                     self.round_counter += 1
             if self.round_counter == 2:
                 self.stage = Stage.RIVER
                 self.public_cards.append(self.dealer.deal_card())
+                if self.record_steps:
+                    self.steps_recorder.add_step_next_stage(self.stage, [str(self.public_cards[-1])],
+                                                            self.get_state())
                 if len(self.players) == np.sum(players_in_bypass):
                     self.round_counter += 1
 
@@ -182,11 +218,11 @@ class NolimitholdemGame(Game):
 
         return state, self.game_pointer
 
-    def get_state(self, player_id):
-        ''' Return player's state
+    def get_state(self, player_id=None):
+        ''' Return state of the game, with player's state if a player_id is given.
 
         Args:
-            player_id (int): player id
+            player_id (int): player id, can be None.
 
         Returns:
             (dict): The state of the player
@@ -195,11 +231,19 @@ class NolimitholdemGame(Game):
 
         chips = [self.players[i].in_chips for i in range(self.num_players)]
         legal_actions = self.get_legal_actions()
-        state = self.players[player_id].get_state(self.public_cards, chips, legal_actions)
+
+        if player_id is not None:
+            state = self.players[player_id].get_state(self.public_cards, chips, legal_actions)
+            if self.record_steps:
+                state['steps_record'] = self.steps_recorder.players_record[player_id]
+        else:
+            state = dict()
+
         state['stakes'] = [self.players[i].remained_chips for i in range(self.num_players)]
         state['current_player'] = self.game_pointer
         state['pot'] = self.dealer.pot
         state['stage'] = self.stage
+
         return state
 
     def step_back(self):
@@ -229,7 +273,59 @@ class NolimitholdemGame(Game):
         '''
         hands = [p.hand + self.public_cards if p.status in (PlayerStatus.ALIVE, PlayerStatus.ALLIN) else None for p in self.players]
         chips_payoffs = self.judger.judge_game(self.players, hands)
+
+        if self.record_steps:
+            self.record_steps_showdown(hands)
+            self.steps_recorder.add_step_payoffs_delivered(chips_payoffs, self.get_state())
+
         return chips_payoffs
+
+    def record_steps_showdown(self, hands):
+        ''' Record the steps of the showdown if there is one, especially who shows his hand and in which order
+
+        Args:
+            hands (list): Hands of the players, each represented by a list of Cards
+        '''
+
+        if sum([hand is not None for hand in hands]) > 1:
+            # Players must reveal their cards
+            self.steps_recorder.add_step_next_stage(Stage.SHOWDOWN, [], self.get_state())
+
+            steps = self.steps_recorder.full_record
+
+            # Define who is the first player to reveal, by default it is the first after the dealer:
+            first_to_reveal = (self.dealer_id + 1) % self.num_players
+
+            # If someone raised on the river, he must be the first to reveal cards
+            if steps[-2]['type'] != StepsRecorder.Type.NEXT_STAGE:
+                # The river was played
+                assert steps[-2]['type'] == StepsRecorder.Type.PLAYER_ACTION
+                if steps[-2]['action'] != Action.CHECK:
+                    # The river was played and someone raised
+                    i = -2
+                    # Skip players who folded or called
+                    while steps[i]['action'] in [Action.FOLD, Action.CALL]:
+                        i -= 1
+                    # We necessarily come to a player who raised, he must be the first to reveal his cards
+                    assert steps[i]['action'] in [Action.RAISE_POT, Action.RAISE_HALF_POT, Action.ALL_IN]
+                    first_to_reveal = steps[i]['player_id']
+
+            hands_ordered_by_reveal = np.roll(hands, -first_to_reveal)
+            for i in range(self.num_players):
+                if hands_ordered_by_reveal[i] is None:
+                    continue
+
+                player_id = (i + first_to_reveal) % self.num_players
+                # If the player can win against the adversaries who revealed, he reveals his cards
+                if compare_hands([[card.get_index() for card in hand] if hand is not None else None for hand in
+                                  hands_ordered_by_reveal[:i + 1]])[-1]:
+                    str_hand = [card.get_index() for card in hands[player_id]]
+                    self.steps_recorder.add_step_hand_revealed(player_id, str_hand)
+                else:
+                    self.steps_recorder.add_step_hand_revealed(player_id, None)
+
+        else:
+            self.steps_recorder.add_step_next_stage(Stage.END_HIDDEN, [], self.get_state())
 
     @staticmethod
     def get_action_num():
@@ -240,6 +336,78 @@ class NolimitholdemGame(Game):
         '''
         return len(Action)
 
+
+class StepsRecorder():
+
+    class Type(Enum):
+        ''' Types of steps in the game '''
+        DEALER_DESIGNED = 0
+        HAND_DEALT = 1
+        BLIND = 2
+        PLAYER_ACTION = 3
+        NEXT_STAGE = 4
+        HAND_REVEALED = 5
+        PAYOFFS_DELIVERED = 6
+
+    def __init__(self, num_players):
+        self.num_players = num_players
+        self.step_id = 0
+        self.players_record = [[] for _ in range(num_players)]
+        self.full_record = []
+
+    def add_step(self, step, visibility=None):
+        if visibility is None:
+            visibility = [True] * self.num_players
+        step['visibility'] = visibility
+        step['id'] = self.step_id
+        self.step_id += 1
+        self.full_record.append(step)
+        for player_record, visible in zip(self.players_record, visibility):
+            if visible:
+                player_record.append(step)
+
+    def add_step_dealer_designed(self, dealer_id):
+        self.add_step(dict(type=self.Type.DEALER_DESIGNED,
+                           dealer_id=dealer_id))
+
+    def add_step_hand_dealt(self, player_id, hand):
+        self.add_step(dict(type=self.Type.HAND_DEALT,
+                           player_id=player_id,
+                           hand=hand),
+                      [p == player_id for p in range(self.num_players)])
+
+    def add_step_blind(self, player_id, blind):
+        self.add_step(dict(type=self.Type.BLIND,
+                           player_id=player_id,
+                           blind=blind))
+
+    def add_step_player_action(self, player_id, action, player_status, state):
+        self.add_step(dict(type=self.Type.PLAYER_ACTION,
+                           player_id=player_id,
+                           action=action,
+                           player_status=player_status,
+                           state=state))
+
+    def add_step_next_stage(self, stage, public_cards, state):
+        self.add_step(dict(type=self.Type.NEXT_STAGE,
+                           stage=stage,
+                           public_cards=public_cards,
+                           state=state))
+
+    def add_step_hand_revealed(self, player_id, hand):
+        self.add_step(dict(type=self.Type.HAND_REVEALED,
+                           player_id=player_id,
+                           hand=hand))
+
+    def add_step_payoffs_delivered(self, payoffs, state):
+        self.add_step(dict(type=self.Type.PAYOFFS_DELIVERED,
+                           payoffs=payoffs,
+                           state=state))
+
+    @classmethod
+    def step_to_str(cls, step):
+        return "%s: %s" % (
+            step['type'], ', '.join(["%s=%s" % (key, value) for key, value in step.items() if key != 'type']))
 
 #if __name__ == "__main__":
 #    game = NolimitholdemGame()
